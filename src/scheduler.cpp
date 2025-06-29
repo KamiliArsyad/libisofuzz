@@ -1,6 +1,7 @@
 #include "scheduler.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <queue>
@@ -29,11 +30,23 @@ struct CompareTrxPriority
   }
 };
 
+// --- NEW: Epoch-based state ---
+enum class EpochState { COLLECTING, DRAINING };
+
+static std::atomic<EpochState> g_epoch_state(EpochState::COLLECTING);
+static std::chrono::milliseconds EPOCH_DURATION_MS(5);
+
 // --- Global Scheduler State ---
 static std::thread scheduler_thread;
 static std::atomic<bool> scheduler_running(false);
+
+// This mutex protects the main scheduler_queue and the trx_wait_map.
 static std::mutex scheduler_global_mutex;
 static std::condition_variable scheduler_wakeup_cv;
+
+// This mutex protects the new pending_requests queue.
+static std::mutex pending_queue_mutex;
+static std::queue<TrxPriority> pending_requests;
 
 // Map from a transaction's library ID to its personal wait info.
 static std::unordered_map<uint64_t, std::unique_ptr<TrxWaitInfo>> trx_wait_map;
@@ -46,7 +59,7 @@ static std::mt19937 rng;
 
 static void init_rng()
 {
-  int seed = 42; // Default seed
+  int seed = 42;
   const char* seed_str = std::getenv("RANDOM_SEED");
   if (seed_str != nullptr)
   {
@@ -56,7 +69,6 @@ static void init_rng()
     }
     catch (const std::exception&)
     {
-      // Keep default seed if conversion fails
     }
   }
   rng.seed(seed);
@@ -68,46 +80,77 @@ static int get_random_priority()
   return dist(rng);
 }
 
-// --- Main Scheduler Thread Logic ---
+// --- Main Scheduler Thread Logic (State Machine) ---
 static void trx_scheduler_run()
 {
   while (scheduler_running.load(std::memory_order_acquire))
   {
-    std::unique_ptr<TrxWaitInfo> wait_info_ptr;
-    uint64_t next_trx_id = 0;
-
+    if (g_epoch_state.load(std::memory_order_relaxed) == EpochState::COLLECTING)
     {
-      std::unique_lock lock(scheduler_global_mutex);
-      scheduler_wakeup_cv.wait(lock, []
-      {
-        return !scheduler_running.load(std::memory_order_acquire) || !scheduler_queue.empty();
-      });
+      // Phase 1: Collect requests for a fixed duration.
+      std::this_thread::sleep_for(EPOCH_DURATION_MS);
 
-      if (!scheduler_running.load(std::memory_order_acquire))
+      std::queue<TrxPriority> local_pending;
       {
-        break;
+        // Atomically grab all pending requests.
+        std::lock_guard lock(pending_queue_mutex);
+        if (pending_requests.empty())
+        {
+          continue; // Nothing to do, start another collecting phase.
+        }
+        local_pending.swap(pending_requests);
       }
 
-      if (!scheduler_queue.empty())
+      // Transition to Draining phase.
       {
-        next_trx_id = scheduler_queue.top().second;
-        scheduler_queue.pop();
-
-        auto it = trx_wait_map.find(next_trx_id);
-        if (it != trx_wait_map.end())
+        std::lock_guard lock(scheduler_global_mutex);
+        while (!local_pending.empty())
         {
-          wait_info_ptr = std::move(it->second);
-          trx_wait_map.erase(it);
+          scheduler_queue.push(local_pending.front());
+          local_pending.pop();
         }
+        g_epoch_state.store(EpochState::DRAINING, std::memory_order_relaxed);
+        // Wake up the scheduler thread in case it was waiting on an empty queue.
+        scheduler_wakeup_cv.notify_one();
       }
     }
-
-    if (wait_info_ptr && next_trx_id != 0)
+    else
     {
-      std::unique_lock trx_lock(wait_info_ptr->mtx);
-      wait_info_ptr->is_ready = true;
-      trx_lock.unlock();
-      wait_info_ptr->cv.notify_one();
+      // DRAINING state
+      // Phase 2: Process the collected batch.
+      std::unique_lock lock(scheduler_global_mutex);
+
+      if (scheduler_queue.empty())
+      {
+        // Batch is drained, switch back to collecting.
+        g_epoch_state.store(EpochState::COLLECTING, std::memory_order_relaxed);
+        lock.unlock();
+        continue;
+      }
+
+      // Get next transaction from the randomized queue.
+      uint64_t next_trx_id = scheduler_queue.top().second;
+      scheduler_queue.pop();
+
+      auto it = trx_wait_map.find(next_trx_id);
+      if (it != trx_wait_map.end())
+      {
+        std::unique_ptr<TrxWaitInfo> wait_info_ptr = std::move(it->second);
+        trx_wait_map.erase(it);
+
+        // Release the global lock before notifying the specific thread.
+        lock.unlock();
+
+        std::unique_lock trx_lock(wait_info_ptr->mtx);
+        wait_info_ptr->is_ready = true;
+        trx_lock.unlock();
+        wait_info_ptr->cv.notify_one();
+      }
+      else
+      {
+        // Should not happen, but unlock if it does.
+        lock.unlock();
+      }
     }
   }
 }
@@ -119,6 +162,21 @@ void scheduler_init()
   bool already_running = scheduler_running.exchange(true, std::memory_order_acq_rel);
   if (!already_running)
   {
+    const char* epoch_ms_str = std::getenv("ISOFUZZ_EPOCH_MS");
+    if (epoch_ms_str)
+    {
+      try
+      {
+        long ms = std::stol(epoch_ms_str);
+        if (ms > 0)
+        {
+          EPOCH_DURATION_MS = std::chrono::milliseconds(ms);
+        }
+      }
+      catch (const std::exception&)
+      {
+      }
+    }
     init_rng();
     scheduler_thread = std::thread(trx_scheduler_run);
   }
@@ -144,23 +202,26 @@ void scheduler_shutdown()
   }
 }
 
+// This function now just adds requests to the pending queue.
 void scheduler_request(uint64_t trx_lib_id, IsoFuzzSchedulerIntent /* intent */)
 {
-  // The 'intent' parameter is currently unused, but is available for future
-  // feedback-driven scheduling logic where priorities could be assigned
-  // based on the intended operation.
-
   auto wait_info = std::make_unique<TrxWaitInfo>();
   TrxWaitInfo* wait_info_ptr = wait_info.get();
+  TrxPriority priority_entry = {get_random_priority(), trx_lib_id};
 
   {
+    // Add request to the pending queue.
+    std::lock_guard lock(pending_queue_mutex);
+    pending_requests.push(priority_entry);
+  }
+
+  {
+    // Add the waiter information to the map.
     std::lock_guard lock(scheduler_global_mutex);
-    scheduler_queue.push({get_random_priority(), trx_lib_id});
     trx_wait_map[trx_lib_id] = std::move(wait_info);
   }
 
-  scheduler_wakeup_cv.notify_one();
-
+  // Block this thread on its personal waiting room until the scheduler releases it.
   std::unique_lock trx_lock(wait_info_ptr->mtx);
   wait_info_ptr->cv.wait(trx_lock, [wait_info_ptr] { return wait_info_ptr->is_ready; });
 }

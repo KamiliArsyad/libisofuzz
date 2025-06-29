@@ -74,9 +74,17 @@ void isofuzz_shutdown();
  * The library creates an internal representation for the transaction and assigns
  * it a temporary, library-local ID, which is essential for tracking read-only
  * transactions that do not yet have a DBMS-assigned ID.
+ * Atomically handles handle creation, scheduling, and logging of the BEGIN event.
  * @return An opaque handle to the transaction.
  */
 isofuzz_trx_t isofuzz_trx_begin();
+
+/**
+ * @brief Commits a transaction. Atomically handles scheduling and logging
+ * of the COMMIT event.
+ * @param trx_handle The handle of the transaction being committed.
+ */
+void isofuzz_trx_commit(isofuzz_trx_t trx_handle);
 
 /**
  * @brief Notifies the library that a read-only transaction has been promoted to
