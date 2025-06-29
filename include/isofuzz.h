@@ -28,7 +28,9 @@ enum class IsoFuzzOpType
   WRITE_DELETE,
   // This event logs the promotion of a read-only transaction to read-write,
   // capturing the point where it receives a permanent DBMS-assigned ID.
-  TXN_PROMOTE
+  TXN_PROMOTE,
+  TXN_BEGIN,
+  TXN_COMMIT
 };
 
 // Generic description of a data object involved in an operation.
