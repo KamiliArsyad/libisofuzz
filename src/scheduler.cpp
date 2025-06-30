@@ -1,8 +1,10 @@
 #include "scheduler.h"
 
+#include <assert.h>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <iostream>
 #include <mutex>
 #include <queue>
 #include <random>
@@ -12,6 +14,8 @@
 #include <vector>
 
 // State for a single waiting transaction thread.
+// The TrxWaitInfo object is now a plain C++ object. Its lifetime will be
+// managed manually by the requesting thread.
 struct TrxWaitInfo
 {
   std::mutex mtx;
@@ -49,7 +53,10 @@ static std::mutex pending_queue_mutex;
 static std::queue<TrxPriority> pending_requests;
 
 // Map from a transaction's library ID to its personal wait info.
-static std::unordered_map<uint64_t, std::unique_ptr<TrxWaitInfo>> trx_wait_map;
+// Note: The trx_wait_map no longer holds owning unique_ptrs. It now holds
+// non-owning raw pointers. The responsibility for deleting the TrxWaitInfo
+// object now rests entirely with the thread that created it.
+static std::unordered_map<uint64_t, TrxWaitInfo*> trx_wait_map;
 
 // The main priority queue of transactions waiting for their turn.
 static std::priority_queue<TrxPriority, std::vector<TrxPriority>, CompareTrxPriority> scheduler_queue;
@@ -87,21 +94,18 @@ static void trx_scheduler_run()
   {
     if (g_epoch_state.load(std::memory_order_relaxed) == EpochState::COLLECTING)
     {
-      // Phase 1: Collect requests for a fixed duration.
       std::this_thread::sleep_for(EPOCH_DURATION_MS);
 
       std::queue<TrxPriority> local_pending;
       {
-        // Atomically grab all pending requests.
         std::lock_guard lock(pending_queue_mutex);
         if (pending_requests.empty())
         {
-          continue; // Nothing to do, start another collecting phase.
+          continue;
         }
         local_pending.swap(pending_requests);
       }
 
-      // Transition to Draining phase.
       {
         std::lock_guard lock(scheduler_global_mutex);
         while (!local_pending.empty())
@@ -110,37 +114,40 @@ static void trx_scheduler_run()
           local_pending.pop();
         }
         g_epoch_state.store(EpochState::DRAINING, std::memory_order_relaxed);
-        // Wake up the scheduler thread in case it was waiting on an empty queue.
         scheduler_wakeup_cv.notify_one();
       }
     }
     else
     {
       // DRAINING state
-      // Phase 2: Process the collected batch.
       std::unique_lock lock(scheduler_global_mutex);
 
       if (scheduler_queue.empty())
       {
-        // Batch is drained, switch back to collecting.
         g_epoch_state.store(EpochState::COLLECTING, std::memory_order_relaxed);
         lock.unlock();
         continue;
       }
 
-      // Get next transaction from the randomized queue.
       uint64_t next_trx_id = scheduler_queue.top().second;
       scheduler_queue.pop();
 
       auto it = trx_wait_map.find(next_trx_id);
       if (it != trx_wait_map.end())
       {
-        std::unique_ptr<TrxWaitInfo> wait_info_ptr = std::move(it->second);
+        // --- CRITICAL CHANGE ---
+        // We retrieve the raw pointer but DO NOT take ownership.
+        TrxWaitInfo* wait_info_ptr = it->second;
+
+        // We are done with this entry in the map, so we erase it.
+        // This prevents other threads from ever seeing a stale pointer.
+        // The worker thread still holds the valid pointer and is responsible for deletion.
         trx_wait_map.erase(it);
 
         // Release the global lock before notifying the specific thread.
         lock.unlock();
 
+        // Wake up the worker thread.
         std::unique_lock trx_lock(wait_info_ptr->mtx);
         wait_info_ptr->is_ready = true;
         trx_lock.unlock();
@@ -148,7 +155,9 @@ static void trx_scheduler_run()
       }
       else
       {
-        // Should not happen, but unlock if it does.
+        // This should not happen if the logic is correct.
+        // It means a request was scheduled for which we have no waiter info.
+        assert(false && "Scheduler found a transaction ID with no waiter info.");
         lock.unlock();
       }
     }
@@ -199,29 +208,43 @@ void scheduler_shutdown()
       pair.second->cv.notify_all();
     }
     trx_wait_map.clear();
+
+    // --- INVARIANT CHECK ON SHUTDOWN ---
+    // On a clean shutdown, the wait map should be empty. If it's not,
+    // it implies some transactions were blocked and never cleaned up,
+    // which would lead to a memory leak.
+    assert(trx_wait_map.empty() && "trx_wait_map not empty on shutdown; memory will be leaked.");
   }
 }
 
 // This function now just adds requests to the pending queue.
-void scheduler_request(uint64_t trx_lib_id, IsoFuzzSchedulerIntent /* intent */)
-{
-  auto wait_info = std::make_unique<TrxWaitInfo>();
-  TrxWaitInfo* wait_info_ptr = wait_info.get();
+void scheduler_request(uint64_t trx_lib_id, IsoFuzzSchedulerIntent /* intent */) {
+  // Step 1: The worker thread allocates its own waiter object on the heap.
+  TrxWaitInfo* wait_info_ptr = new TrxWaitInfo();
+
   TrxPriority priority_entry = {get_random_priority(), trx_lib_id};
 
+  // Step 2: Add the request to the pending queue for the scheduler thread.
   {
-    // Add request to the pending queue.
     std::lock_guard lock(pending_queue_mutex);
     pending_requests.push(priority_entry);
   }
 
+  // Step 3: Add the NON-OWNING pointer to the global map so the scheduler can find it.
   {
-    // Add the waiter information to the map.
     std::lock_guard lock(scheduler_global_mutex);
-    trx_wait_map[trx_lib_id] = std::move(wait_info);
+    trx_wait_map[trx_lib_id] = wait_info_ptr;
   }
 
-  // Block this thread on its personal waiting room until the scheduler releases it.
-  std::unique_lock trx_lock(wait_info_ptr->mtx);
-  wait_info_ptr->cv.wait(trx_lock, [wait_info_ptr] { return wait_info_ptr->is_ready; });
+  // Step 4: The worker thread blocks, waiting for the scheduler to signal its CV.
+  {
+    std::unique_lock trx_lock(wait_info_ptr->mtx);
+    wait_info_ptr->cv.wait(trx_lock, [wait_info_ptr] { return wait_info_ptr->is_ready; });
+  }
+
+  // Step 5: CRITICAL CLEANUP
+  // Once woken up, the worker thread is now responsible for deleting the
+  // waiter object it created. This happens on the same thread that called `new`,
+  // eliminating the cross-thread destruction and the heap corruption bug.
+  delete wait_info_ptr;
 }
