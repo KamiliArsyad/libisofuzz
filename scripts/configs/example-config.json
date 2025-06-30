@@ -1,0 +1,12 @@
+{
+"iterations": 5,
+"mutate": false,
+"max_mutate_budget": 5,
+"base_log_dir": "/path/to/libisofuzz/result",
+"prog-bin": "/path/to/mysql/build/mysql/bin/mysqld --defaults-file=/path/to/mysql/build/mysql/etc/my.cnf",
+"elle-bin": "java -jar /path/to/elle-cli/target/elle-cli-0.1.8-standalone.jar --model list-append",
+"edn-maker-bin": "python3 /path/to/libisofuzz/scripts/translate_to_elle.py",
+"workload-bin": "path/to/workload/run-test.sh -r 2",
+"shutdown-cmd": "path/to/mysql/build/mysql/bin/mysqladmin --socket=/path/to/mysql/build/mysql/mysql.sock -u root -h localhost shutdown",
+"check-ready-cmd": "/path/to/mysql/build/mysql/bin/mysqladmin --socket=/path/to/mysql/build/mysql/mysql.sock -u root -h localhost ping"
+}

@@ -23,6 +23,9 @@ The central challenge in high-level semantic fuzzing is creating meaningful inte
 
 This model is deadlock-free by design and is highly effective at turning seemingly serial request streams into highly concurrent test scenarios, dramatically increasing the chances of finding subtle isolation bugs.
 
+## Runner
+Please check the README in `/scripts` to understand how to run the `libisofuzz`-instrumented DBMS through the fuzzing cycle.
+
 ## Features
 
 -   **Generic by Design:** Can be integrated into any thread-per-connection DBMS (like MySQL, PostgreSQL, etc.) by implementing a simple adapter.

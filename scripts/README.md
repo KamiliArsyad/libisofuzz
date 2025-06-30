@@ -45,6 +45,8 @@ The runner is configured via a single JSON file. You must create this file and p
 }
 ```
 
+I have also attached an example config that I usually use in `/configs`.
+
 ### Configuration Options:
 
 - **`prog-bin`**: (string, required) The full command prefix to start the DBMS server executable.
