@@ -169,7 +169,7 @@ class FuzzRunner:
             return ELLE_OK
 
         for v_file in out_dir.iterdir():
-            if v_file.suffix == ".txt" and ELLE_REALTIME_KEYWORD not in v_file.name.lower():
+            if v_file.suffix != ".txt" and ELLE_REALTIME_KEYWORD not in v_file.name.lower():
                 return ELLE_VIOLATION
 
         return ELLE_REALTIME_VIOLATION
