@@ -28,10 +28,10 @@ Please check the README in `/scripts` to understand how to run the `libisofuzz`-
 
 ## Features
 
--   **Generic by Design:** Can be integrated into any thread-per-connection DBMS (like MySQL, PostgreSQL, etc.) by implementing a simple adapter.
+-   **Generic by Design:** Can be integrated into any thread-per-connection DBMS (like MySQL, SQLite, etc.) by implementing a simple adapter.
 -   **Fine-Grained Scheduling:** Interleaves individual row-level operations, not just entire SQL statements, allowing it to find deep storage-level anomalies.
 -   **Deadlock-Free Scheduler:** The epoch-based model is inherently safe from self-deadlocks.
--   **Reproducibility:** Test runs can be made deterministic by providing a seed via an environment variable.
+-   **Reproducibility (not yet here):** Test runs can be made deterministic by providing a seed via an environment variable.
 -   **Tunable:** The scheduling behavior can be tuned via environment variables to suit different workloads.
 
 ## Prerequisites
