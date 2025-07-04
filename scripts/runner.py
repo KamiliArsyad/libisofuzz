@@ -168,8 +168,8 @@ class FuzzRunner:
         if ELLE_ANOMALY_KEYWORD not in content.lower():
             return ELLE_OK
 
-        for v_file in out_dir.iterdir():
-            if v_file.suffix != ".txt" and ELLE_REALTIME_KEYWORD not in v_file.name.lower():
+        for d in out_dir.iterdir():
+            if d.is_dir() and d.name != "sccs" and ELLE_REALTIME_KEYWORD not in d.name.lower():
                 return ELLE_VIOLATION
 
         return ELLE_REALTIME_VIOLATION
